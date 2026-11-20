@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Adobe Acrobat Reader
+GenericName=PDF Reader
+Comment=Adobe Acrobat Reader running in the Windows VM (fill and sign PDFs)
+Exec=uwsm app -- acrobat-win %f
+Icon=application-pdf
+Terminal=false
+Type=Application
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupWMClass=acrobat-win

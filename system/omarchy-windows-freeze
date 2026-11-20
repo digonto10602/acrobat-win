@@ -1,0 +1,15 @@
+#!/bin/bash
+# Root-owned helper: freeze, unfreeze, or report the state of the Omarchy
+# Windows VM container. Allowed passwordless via /etc/sudoers.d/acrobat-win-freeze.
+# Accepts exactly one fixed verb and touches exactly one fixed container.
+set -euo pipefail
+CONTAINER=omarchy-windows
+export PATH=/usr/bin:/bin
+
+case "${1:-}" in
+pause)   [[ $(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null) == running ]] && docker pause "$CONTAINER" >/dev/null ;;
+unpause) [[ $(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null) == paused ]] && docker unpause "$CONTAINER" >/dev/null ;;
+status)  docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo absent ;;
+*) echo "usage: omarchy-windows-freeze pause|unpause|status" >&2; exit 2 ;;
+esac
+exit 0

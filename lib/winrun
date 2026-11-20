@@ -1,0 +1,15 @@
+#!/bin/bash
+# winrun <script.ps1> [timeout_s] [args...] — copy a PowerShell script into the VM's shared
+# folder (~/Windows = \\host.lan\Data) and run it in the guest via an RDP RemoteApp.
+# Prints whether RemoteApp launched; the script itself writes its own log/marker.
+set -euo pipefail
+src=$1; t=${2:-120}; shift 2 || shift $#; name=$(basename "$src"); extra="${*:+ $*}"
+cp -f -- "$src" "$HOME/Windows/$name"
+export KRB5_CONFIG=$HOME/.config/windows/krb5.conf
+# FreeRDP tries Kerberos before NTLM; a realm-less krb5.conf makes it skip straight to NTLM.
+[[ -f $KRB5_CONFIG ]] || printf '[libdefaults]\n  dns_lookup_kdc = false\n  dns_lookup_realm = false\n' >"$KRB5_CONFIG"
+U=$(sed -n 's/^USERNAME=//p' ~/.config/windows/credentials); P=$(sed -n 's/^PASSWORD=//p' ~/.config/windows/credentials)
+PS='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+printf '%s\n' "/u:$U" "/p:$P" /v:127.0.0.1:3389 /cert:ignore \
+  "/app:program:$PS,cmd:-NoProfile -ExecutionPolicy Bypass -File \\\\host.lan\\Data\\$name$extra" \
+  /wm-class:winrun | timeout -s KILL "$t" xfreerdp3 /args-from:stdin 2>&1 | grep -E 'ERROR|ERRINFO|RAIL|denied|disconnect' | grep -v Kerberos | tail -5 || true

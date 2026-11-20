@@ -1,0 +1,187 @@
+#!/bin/bash
+# acrobat-win — Adobe Acrobat Reader from the Omarchy Windows VM, in its own Linux window.
+#
+# How it works: the PDF is copied into the Omarchy shared folder (~/Windows/acrobat/…,
+# which Windows sees as \\host.lan\Data\acrobat\… over Samba), the request is written to
+# ~/Windows/open-request.txt, and an RDP session starts whose Windows "shell"
+# (C:\ProgramData\acrobat-win\shell.ps1) is just Acrobat: no taskbar, no desktop.
+# Every save in Acrobat (including "Save As" / signed copies) is copied straight back
+# to the PDF's original Linux folder. Closing Acrobat signs the session out, the window
+# closes, and the VM is frozen (docker pause) until the next launch. Opening another
+# PDF while Acrobat is open adds it as a tab in the same window.
+#
+# Why the copy: RDP drive sharing (\\tsclient) fails Acrobat's save/sign with
+# "an unexpected network error occurred"; the Samba share handles it.
+#
+#   acrobat-win [file.pdf]   open Acrobat (optionally with a file)
+#   acrobat-win --warm       boot the VM in the background, then freeze it
+#   acrobat-win --status     print the VM state
+set -euo pipefail
+
+FREEZE=/usr/local/bin/omarchy-windows-freeze
+INSTALLED_MARKER="$HOME/.config/windows/credentials" # written by omarchy windows vm install
+CRED_FILE="$HOME/.config/windows/credentials"
+SHARE="$HOME/Windows"                                # \\host.lan\Data inside Windows
+REQUEST="$SHARE/open-request.txt"
+STAGE="$SHARE/acrobat"                               # \\host.lan\Data\acrobat
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/acrobat-win"
+MAPS="$STATE_DIR/stage"                              # <id>.dir = original folder of staged files
+BACKUPS="$STATE_DIR/backups"                         # files overwritten by a sync-back
+SYNC_LOG="$STATE_DIR/sync.log"
+LOCK="$STATE_DIR/lock"
+CLIENT_PID="$STATE_DIR/client.pid"
+WM_CLASS=acrobat-win
+mkdir -p "$STATE_DIR" "$MAPS" "$STAGE"
+
+notify() { notify-send -a "Adobe Acrobat Reader" "$@" 2>/dev/null || echo "$*" >&2; }
+die() { notify -u critical "Adobe Acrobat Reader" "$1"; echo "acrobat-win: $1" >&2; exit 1; }
+vm_state() { sudo -n "$FREEZE" status 2>/dev/null | tr -d '\n' || echo unknown; }
+
+read_credential() {
+  local want="$1" key value
+  [[ -f $CRED_FILE ]] || return 1
+  while IFS='=' read -r key value; do
+    [[ $key == "$want" ]] && { printf '%s' "$value"; return 0; }
+  done <"$CRED_FILE"
+  return 1
+}
+
+client_running() { [[ -f $CLIENT_PID ]] && kill -0 "$(cat "$CLIENT_PID")" 2>/dev/null; }
+
+# Make sure the VM is running (not frozen, not stopped).
+ensure_running() {
+  local st
+  st=$(vm_state)
+  case "$st" in
+  *running*) ;;
+  *paused*) sudo -n "$FREEZE" unpause || die "Could not unfreeze the Windows VM." ;;
+  *)
+    [[ -e $INSTALLED_MARKER ]] || die "Windows VM is not installed. Run: omarchy windows vm install"
+    notify "Starting Windows (first launch since boot, ~15–60 s)…"
+    # Omarchy's own privileged bring-up: recreates the protected disk mounts
+    # (required after a reboot) and waits until Windows reports it has booted.
+    pkexec /usr/bin/omarchy-windows-vm __priv up_wait || die "Windows VM failed to start (see: omarchy windows vm status)."
+    ;;
+  esac
+}
+
+# Copy a PDF into the shared folder; print the path Windows uses to open it.
+stage_file() {
+  local f="$1" dir name id
+  dir=$(dirname -- "$f"); name=$(basename -- "$f")
+  id=$(printf '%s' "$dir" | sha1sum | cut -c1-12)    # one staging folder per original folder
+  mkdir -p "$STAGE/$id"
+  printf '%s' "$dir" >"$MAPS/$id.dir"
+  cp -p -- "$f" "$STAGE/$id/$name"
+  printf '\\\\host.lan\\Data\\acrobat\\%s\\%s' "$id" "$name"
+}
+
+# Copy one staged PDF back to its original folder (only if its content changed).
+sync_back() {
+  local p="$1" rel id name dir dest
+  [[ -f $p && ${p,,} == *.pdf ]] || return 0
+  rel=${p#"$STAGE"/}; id=${rel%%/*}; name=${rel#*/}
+  [[ $name != */* && -f $MAPS/$id.dir ]] || return 0
+  dir=$(cat "$MAPS/$id.dir"); dest="$dir/$name"
+  [[ -d $dir ]] || { echo "$(date +%T) skip $name: $dir is gone" >>"$SYNC_LOG"; return 0; }
+  if [[ -e $dest ]]; then
+    cmp -s -- "$p" "$dest" && return 0
+    mkdir -p "$BACKUPS"; cp -p -- "$dest" "$BACKUPS/$(date +%Y%m%d-%H%M%S)-$name"   # never lose the previous version
+  fi
+  cp -- "$p" "$dest.acrobat-win.tmp" && mv -f -- "$dest.acrobat-win.tmp" "$dest"
+  echo "$(date +%T) saved $dest" >>"$SYNC_LOG"
+}
+
+# Watch the staging folder and sync every finished write back (runs while Acrobat is open).
+start_sync() {
+  inotifywait -m -r -q -e close_write,moved_to --format '%w%f' "$STAGE" 2>>"$SYNC_LOG" \
+    > >(while IFS= read -r p; do sync_back "$p"; done) &
+  SYNC_PID=$!   # inotifywait itself; the reader loop ends when it does
+}
+
+# Final pass after the session ends. $1=clean: Acrobat was closed (Windows signed out),
+# so the staged copies can go; otherwise only the window was closed and Acrobat still has
+# them open in the background session, so keep them for the next connection.
+finish_sync() {
+  [[ -n ${SYNC_PID:-} ]] && kill "$SYNC_PID" 2>/dev/null || true
+  local p
+  while IFS= read -r -d '' p; do sync_back "$p"; done < <(find "$STAGE" -mindepth 2 -maxdepth 2 -type f -iname '*.pdf' -print0)
+  if [[ ${1:-} == clean ]]; then
+    find "$STAGE" -mindepth 1 -delete 2>/dev/null || true
+    rm -f -- "$MAPS"/*.dir
+  fi
+}
+
+# Write the request atomically (Windows reads it as UTF-8).
+write_request() {
+  local tmp
+  tmp=$(mktemp "$SHARE/.open-request.XXXXXX")
+  printf '%s' "$1" >"$tmp"
+  mv -f -- "$tmp" "$REQUEST"
+}
+
+connect() {
+  local user pass
+  user=$(read_credential USERNAME) || user=docker
+  pass=$(read_credential PASSWORD) || pass=admin
+  # Same fix Omarchy uses: skip Kerberos (MIT sample realm) and go straight to NTLM.
+  local krb="$HOME/.config/windows/krb5.conf"
+  [[ -f $krb ]] || printf '[libdefaults]\n  dns_lookup_kdc = false\n  dns_lookup_realm = false\n' >"$krb"
+  export KRB5_CONFIG="$krb"
+
+  local args=(
+    "/u:$user" "/p:$pass" /v:127.0.0.1:3389
+    /cert:ignore /clipboard /sound /gfx +auto-reconnect
+    /dynamic-resolution /size:1280x960 -grab-keyboard
+    "/wm-class:$WM_CLASS" "/title:Adobe Acrobat Reader"
+  )
+  # Arguments go over stdin so the password never shows up in `ps`.
+  printf '%s\n' "${args[@]}" | xfreerdp3 /args-from:stdin >"$STATE_DIR/client.log" 2>&1 &
+  echo $! >"$CLIENT_PID"
+  wait $! || true
+  rm -f -- "$CLIENT_PID"
+}
+
+case "${1:-}" in
+--status) vm_state; echo; exit 0 ;;
+--warm)
+  [[ -e $INSTALLED_MARKER ]] || exit 0 # not installed yet: nothing to warm
+  client_running && exit 0
+  ensure_running
+  sleep 45 # let Windows finish its post-boot background work before freezing
+  client_running || sudo -n "$FREEZE" pause || true
+  exit 0
+  ;;
+-h | --help) sed -n 2,20p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+file=""
+if [[ -n ${1:-} ]]; then
+  file=$(realpath -e -- "$1") || die "File not found: $1"
+fi
+
+exec {lockfd}>"$LOCK"
+flock -x "$lockfd"
+ensure_running
+winpath=""
+[[ -n $file ]] && winpath=$(stage_file "$file")
+write_request "$winpath"
+
+if client_running; then
+  # Acrobat is already open: the Windows side picks up the request and adds a tab;
+  # the running launcher's watcher syncs its saves back.
+  addr=$(hyprctl clients -j | jq -r --arg c "$WM_CLASS" '.[] | select(.class==$c) | .address' | head -1)
+  [[ -n $addr ]] && hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null 2>&1 || true
+  exit 0
+fi
+start_sync
+flock -u "$lockfd"
+
+connect
+# Session over (Acrobat closed, or the window was closed): sync, then freeze the VM.
+exec {lockfd}>"$LOCK"
+flock -x "$lockfd"
+if ! client_running; then
+  if grep -q 'LOGOFF_BY_USER' "$STATE_DIR/client.log" 2>/dev/null; then finish_sync clean; else finish_sync; fi
+  sudo -n "$FREEZE" pause || true
+fi
